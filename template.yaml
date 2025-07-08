@@ -1,0 +1,212 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: fleet-migration-template
+  title: Fleet Migration
+  description: Easily add, remove, or edit files in bulk
+spec:
+  owner: group:devex
+  type: migration
+
+  parameters:
+    # TODO: extra filters, e.g. by type, owner, lifecycle, annotation, etc... probably with a custom field extension
+    - title: Entity Selection
+      required:
+        - entity_kind
+        - entity_limit
+      properties:
+        entity_kind:
+          title: Kind
+          type: string
+          description: Which entity kind should be migrated? (e.g. Component, Resource, etc.)
+          enum:
+            - Component
+            - Resource
+            - API
+            - Template
+            - Domain
+            - System
+            - Group
+            - User
+            - Location
+        entity_limit:
+          title: Limit
+          type: integer
+          description: How many entities should be migrated? (can support 100's but may take 5+ minutes)
+          default: 100
+        entity_owner:
+          title: Owner
+          type: string
+          description: Who is the owner of the entities?
+          ui:field: OwnerPicker
+          ui:options:
+            catalogFilter:
+              - kind: Group
+
+    - title: Find / Replace
+      required:
+        - find_replace_list
+      properties:
+        find_replace_list:
+          title: Find Replace Migrations
+          type: array
+          minItems: 0
+          ui:options:
+            addable: true
+            removable: true
+          items:
+            title: Find/Replace
+            required:
+              - file_filter
+              - find_string
+              - replace_string
+              - use_regex
+            type: object
+            properties:
+              file_filter:
+                title: Files
+                type: string
+                description: Which file(s) should be searched? (wildcards are supported with '*')
+              find_string:
+                title: Find
+                type: string
+                description: Which string should be replaced?
+              replace_string:
+                title: Replace
+                type: string
+                description: What should be the replacement value?
+              use_regex:
+                title: Use regex for search?
+                type: boolean
+                default: false
+
+    - title: Add / Remove Files
+      required:
+        - add_file_list
+        - remove_file_list
+      properties:
+        add_file_list:
+          title: Add File Migrations
+          type: array
+          minItems: 0
+          ui:options:
+            addable: true
+            removable: true
+          items:
+            title: Add File
+            required:
+              - file_path
+              - file_contents
+            type: object
+            properties:
+              file_path:
+                title: File Path
+                type: string
+                description: Which file should be added?
+              file_contents:
+                title: File Contents
+                type: string
+                ui:widget: textarea
+                ui:options:
+                  rows: 10
+        remove_file_list:
+          # TODO: ready once this is deployed - https://github.com/backstage/backstage/pull/30252/files
+          title: Remove File Migrations
+          type: array
+          minItems: 0
+          ui:options:
+            addable: true
+            removable: true
+          items:
+            title: File Path
+            type: string
+            description: Which file or directory should be removed?
+
+    - title: PR Details
+      required:
+        - pr_branch
+        - pr_title
+        - pr_description
+      properties:
+        pr_branch:
+          title: PR Branch
+          type: string
+          description: Which branch should be used for the PR?
+          default: fleet-migration
+        pr_title:
+          title: PR Title
+          type: string
+          default: fleet migration change
+        pr_description:
+          title: PR Description
+          type: string
+          default: This change was sent from a fleet migration.
+          ui:widget: textarea
+          ui:options:
+            rows: 10
+
+  steps:
+    - id: get_entities
+      name: Get Entities
+      action: catalog:query:plus
+      input:
+        queries:
+          - limit: ${{ parameters.entity_limit }}
+            filter:
+              kind: ${{ parameters.entity_kind }}
+              metadata.annotations.backstage.io/source-location: null
+              metadata.annotations.github.com/project-slug: null
+
+    - id: fetch_entities
+      name: Fetch Entity
+      action: fetch:plain
+      each: ${{ steps.get_entities.output.results[0] }}
+      input:
+        # TODO: test if this works with nested directories (e.g. monorepo), also need to make replace/add/remove relative to nested directories
+        url: ${{ each.value.metadata.annotations['backstage.io/source-location'] | replace('url:', '') }}
+        targetPath: ${{ each.value.metadata.name }}
+
+    # note: look into option to allow replacing in hidden (dot) files
+    - id: replace
+      name: Find and Replace
+      action: roadiehq:utils:fs:replace
+      each: ${{ parameters.find_replace_list }}
+      if: ${{ parameters.find_replace_list.length > 0 }}
+      input:
+        files:
+          - file: ${{ '*/' + each.value.file_filter }}
+            find: ${{ each.value.find_string }}
+            replaceWith: ${{ each.value.replace_string }}
+            matchRegex: ${{ each.value.use_regex }}
+
+    # note: this only works to add a single file, to make it work for multiple this block could be
+    #       repeated (hardcoded) X number of times with a condition - could rethink longer term
+    - id: add_files
+      name: Add Files
+      action: roadiehq:utils:fs:write
+      each: ${{ steps.get_entities.output.results[0] }}
+      if: ${{ parameters.add_file_list.length > 0 }}
+      input:
+        path: ${{ each.value.metadata.name }}/${{ parameters.add_file_list[0].file_path }}
+        content: ${{ parameters.add_file_list[0].file_contents }}
+
+    # remove files here when feature is released
+    - id: send_prs
+      name: Send PRs
+      action: publish:github:pull-request
+      each: ${{ steps.get_entities.output.results[0] }}
+      input:
+        # TODO: use source-location instead of project-slug
+        repoUrl: github.com?owner=${{ each.value.metadata.annotations['github.com/project-slug'].split('/')[0] }}&repo=${{ each.value.metadata.annotations['github.com/project-slug'].split('/')[1] }}
+        branchName: ${{ parameters.pr_branch }}
+        title: ${{ parameters.pr_title }}
+        description: ${{ parameters.pr_description }}
+        update: true
+        sourcePath: ${{ each.value.metadata.name }}
+
+  # TODO: try to not send PR if there are no changes
+
+  output:
+    text:
+      - title: PRs Created
+        content: ${{ steps.send_prs.output.remoteUrl.join('  \n') }}
